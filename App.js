@@ -75,16 +75,21 @@ export default function App() {
   
   // Get location when component mounts
   useEffect(() => {
-    const getLocation = async () => {
-      try {
-        const location = await Location.getCurrentPositionAsync({});
-        setLocation(location);
-      } catch (error) {
-        console.log('Error getting location:', error);
+    const requestLocationPermission = async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      setLocationPermission(status === 'granted');
+      
+      if (status === 'granted') {
+        try {
+          const location = await Location.getCurrentPositionAsync({});
+          setLocation(location);
+        } catch (error) {
+          console.log('Error getting location even with permission:', error);
+        }
       }
     };
     
-    getLocation();
+    requestLocationPermission();
   }, []);
 
   useEffect(() => {
@@ -212,66 +217,72 @@ export default function App() {
     try {
       setIsUploading(true);
       
+      // Generate a unique filename
       const fileName = `${userId}_${Date.now()}.jpg`;
       const filePath = `${userId}/${fileName}`;
       
-      const fileInfo = await FileSystem.getInfoAsync(photoUri);
-      console.log('File info:', fileInfo);
-      
-      if (!fileInfo.exists) {
-        throw new Error('File does not exist at path: ' + photoUri);
-      }
-      
-      // Compress image
+      // Compress and resize the image first
       const resizedPhoto = await ImageManipulator.manipulateAsync(
         photoUri,
-        [{ resize: { width: 800 } }],
-        { format: ImageManipulator.SaveFormat.JPEG, compress: 0.5 }
+        [{ resize: { width: 600 } }], // Smaller size
+        { format: ImageManipulator.SaveFormat.JPEG, compress: 0.4 } // More compression
       );
       
-      // Add the data:image/jpeg;base64 prefix to the base64 string
-      const fileData = await FileSystem.readAsStringAsync(resizedPhoto.uri, {
-        encoding: FileSystem.EncodingType.Base64,
+      console.log('Attempting upload to Supabase...');
+      
+      // Use fetch to upload the file as binary data
+      const fileUri = resizedPhoto.uri;
+      const fileBlob = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.onload = function() {
+          resolve(xhr.response);
+        };
+        xhr.onerror = function(e) {
+          reject(new TypeError('Network request failed'));
+        };
+        xhr.responseType = 'blob';
+        xhr.open('GET', fileUri, true);
+        xhr.send(null);
       });
       
-      const base64WithPrefix = `data:image/jpeg;base64,${fileData}`;
-
-      const { data, error } = await supabase
-        .storage
-        .from('photobucket')
-        .upload(filePath, base64WithPrefix, {
-          contentType: 'image/jpeg',
-          upsert: true,
-          cacheControl: '3600'
-        });
+      // Upload the blob to Supabase
+      const response = await fetch(`${supabaseUrl}/storage/v1/object/photobucket/${filePath}`, {
+        method: 'POST',
+        headers: {
+          'apikey': supabaseKey,
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': 'image/jpeg',
+          'x-upsert': 'true'
+        },
+        body: fileBlob
+      });
       
-      if (error) {
-        console.error('Upload error:', error);
-        throw new Error(`File upload failed: ${error.message}`);
+      console.log('Upload response status:', response.status);
+      
+      // Parse response
+      let responseText;
+      try {
+        responseText = await response.text();
+        console.log('Response text:', responseText);
+      } catch (e) {
+        console.log('Could not get response text:', e);
       }
       
-      const { data: publicUrlData } = supabase
-        .storage
-        .from('photobucket')
-        .getPublicUrl(filePath);
+      if (!response.ok) {
+        throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
+      }
       
-      console.log('Upload successful. Data:', data);
-      console.log('Public URL:', publicUrlData?.publicUrl);
+      // Get the public URL
+      const publicUrl = `${supabaseUrl}/storage/v1/object/public/photobucket/${filePath}`;
+      console.log('Public URL:', publicUrl);
       
       setUploadSuccess(true);
-      Alert.alert(
-        'Success', 
-        'Your photo has been saved!\nURL: ' + publicUrlData?.publicUrl,
-        [{ text: 'OK' }]
-      );
-      
+      Alert.alert('Success', 'Your photo has been saved!', [{ text: 'OK' }]);
+      return true;
     } catch (err) {
-      console.error('Error in upload process:', err.message);
-      Alert.alert(
-        'Upload Issue',
-        `We had trouble uploading your photo: ${err.message}`,
-        [{ text: 'OK' }]
-      );
+      console.error('Error in upload process:', err);
+      Alert.alert('Upload Issue', `Error: ${err.message}`, [{ text: 'OK' }]);
+      return false;
     } finally {
       setIsUploading(false);
     }
@@ -514,14 +525,14 @@ export default function App() {
     try {
       setIsTakingPhoto(true);
       
-      // Take the picture while camera is still mounted
+      // Take the picture with lower quality to avoid memory issues
       const photo = await cameraRef.current.takePictureAsync({
-        quality: 0.7,
-        skipProcessing: false,
-        exif: true
+        quality: 0.5,
+        skipProcessing: true,
+        exif: false // Disable exif to save memory
       });
       
-      console.log('Photo taken:', photo);
+      console.log('Photo taken, uri length:', photo.uri?.length || 0);
       
       // Store the photo details first
       setCapturedPhoto(photo.uri);
@@ -530,7 +541,7 @@ export default function App() {
       // First transition from camera view to prevent unmounting issues
       setShowARScreen(false);
       
-      // After we've safely exited the camera view, start analysis
+      // After we've safely exited the camera view, start analysis with a longer timeout
       setTimeout(() => {
         analyzeImageWithClaude(photo.uri)
           .catch(error => {
@@ -539,7 +550,7 @@ export default function App() {
           .finally(() => {
             setIsTakingPhoto(false);
           });
-      }, 500);
+      }, 1000); // Longer timeout to ensure clean exit from camera
       
     } catch (error) {
       console.log('Error taking picture:', error);
@@ -587,158 +598,173 @@ export default function App() {
     );
   };
 
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar style="light" />
-      {showARScreen ? (
-        <View style={styles.arContainer}>
-          {cameraPermission ? (
-            <CameraView
-              ref={cameraRef}
-              style={styles.camera}
-              facing={cameraType}
-              flashMode={flashMode}
-              onCameraReady={() => {
-                console.log('Camera ready');
-                setIsCameraReady(true);
-              }}
-              onError={(error) => {
-                console.log('Camera error:', error);
-                setIsCameraReady(false);
-                Alert.alert('Camera Error', 'There was an issue with the camera: ' + error.message);
-              }}
-            >
-              <View style={styles.topButtons}>
-                <TouchableOpacity 
-                  style={styles.button} 
-                  onPress={() => setShowARScreen(false)}
-                  disabled={isTakingPhoto}
-                >
-                  <Text style={styles.buttonText}>Back</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity 
-                  style={styles.button} 
-                  onPress={toggleFlash}
-                  disabled={isTakingPhoto}
-                >
-                  <Text style={styles.buttonText}>
-                    {flashMode === 'off' ? '🔦 On' : '🔦 Off'}
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity 
-                  style={styles.button} 
-                  onPress={toggleCameraType}
-                  disabled={isTakingPhoto}
-                >
-                  <Text style={styles.buttonText}>📷 Flip</Text>
-                </TouchableOpacity>
-              </View>
-              
-              {/* Location coordinates in bottom corner */}
-              {location && (
-                <Animated.View 
-                  style={[
-                    styles.locationContainer,
-                    { opacity: fadeAnim }
-                  ]}
-                >
-                  <Text style={styles.locationText}>
-                    📍 {location.coords.latitude.toFixed(4)}, {location.coords.longitude.toFixed(4)}
-                  </Text>
-                </Animated.View>
-              )}
-              
-              <View style={styles.bottomButtons}>
-                <TouchableOpacity 
-                  style={[
-                    styles.captureButton, 
-                    isTakingPhoto && styles.disabledButton
-                  ]} 
-                  onPress={takePicture}
-                  disabled={isTakingPhoto}
-                >
-                  {isTakingPhoto ? (
-                    <ActivityIndicator size="large" color="#FFF" />
-                  ) : (
-                    <View style={styles.captureButtonInner} />
-                  )}
-                </TouchableOpacity>
-              </View>
-            </CameraView>
-          ) : (
-            <View style={styles.cameraBackground}>
-              <Text style={styles.permissionText}>Camera permission is required</Text>
-              <TouchableOpacity
-                style={styles.permissionButton}
-                onPress={async () => {
-                  const { status } = await Camera.requestCameraPermissionsAsync();
-                  setCameraPermission(status === 'granted');
+  try {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar style="light" />
+        {showARScreen ? (
+          <View style={styles.arContainer}>
+            {cameraPermission ? (
+              <CameraView
+                ref={cameraRef}
+                style={styles.camera}
+                facing={cameraType}
+                flashMode={flashMode}
+                onCameraReady={() => {
+                  console.log('Camera ready');
+                  setIsCameraReady(true);
+                }}
+                onError={(error) => {
+                  console.log('Camera error:', error);
+                  setIsCameraReady(false);
+                  Alert.alert('Camera Error', 'There was an issue with the camera: ' + error.message);
                 }}
               >
-                <Text style={styles.permissionButtonText}>Grant Permission</Text>
-              </TouchableOpacity>
-            </View>
-          )}
-        </View>
-      ) : (
-        <ScrollView 
-          contentContainerStyle={styles.scrollContainer}
-          bounces={false}
-        >
-          <View style={styles.startContainer}>
-            {capturedPhoto ? (
-              <View style={styles.previewContainer}>
-                <Text style={styles.previewText}>
-                  {isLandmark ? 'Landmark Detected!' : 'Landmark NOT Detected'}
-                </Text>
-                <Image 
-                  source={{ uri: capturedPhoto }} 
-                  style={styles.previewImage}
-                  resizeMode="contain"
-                />
-                {isLandmark && analyzeResults && (
-                  <View style={styles.analysisContainer}>
-                    <Text style={styles.analysisText}>{analyzeResults}</Text>
-                    {landmarkDetails && (
-                      <TouchableOpacity 
-                        style={styles.factsButton}
-                        onPress={() => setShowLandmarkModal(true)}
-                      >
-                        <Text style={styles.factsButtonText}>View Fun Facts</Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                )}
-                {!isLandmark && (
-                  <View style={styles.analysisContainer}>
-                    <Text style={styles.analysisText}>
-                      No landmark was detected in this photo.
+                <View style={styles.topButtons}>
+                  <TouchableOpacity 
+                    style={styles.button} 
+                    onPress={() => setShowARScreen(false)}
+                    disabled={isTakingPhoto}
+                  >
+                    <Text style={styles.buttonText}>Back</Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity 
+                    style={styles.button} 
+                    onPress={toggleFlash}
+                    disabled={isTakingPhoto}
+                  >
+                    <Text style={styles.buttonText}>
+                      {flashMode === 'off' ? '🔦 On' : '🔦 Off'}
                     </Text>
-                  </View>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity 
+                    style={styles.button} 
+                    onPress={toggleCameraType}
+                    disabled={isTakingPhoto}
+                  >
+                    <Text style={styles.buttonText}>📷 Flip</Text>
+                  </TouchableOpacity>
+                </View>
+                
+                {/* Location coordinates in bottom corner */}
+                {location && (
+                  <Animated.View 
+                    style={[
+                      styles.locationContainer,
+                      { opacity: fadeAnim }
+                    ]}
+                  >
+                    <Text style={styles.locationText}>
+                      📍 {location.coords.latitude.toFixed(4)}, {location.coords.longitude.toFixed(4)}
+                    </Text>
+                  </Animated.View>
                 )}
+                
+                <View style={styles.bottomButtons}>
+                  <TouchableOpacity 
+                    style={[
+                      styles.captureButton, 
+                      isTakingPhoto && styles.disabledButton
+                    ]} 
+                    onPress={takePicture}
+                    disabled={isTakingPhoto}
+                  >
+                    {isTakingPhoto ? (
+                      <ActivityIndicator size="large" color="#FFF" />
+                    ) : (
+                      <View style={styles.captureButtonInner} />
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </CameraView>
+            ) : (
+              <View style={styles.cameraBackground}>
+                <Text style={styles.permissionText}>Camera permission is required</Text>
+                <TouchableOpacity
+                  style={styles.permissionButton}
+                  onPress={async () => {
+                    const { status } = await Camera.requestCameraPermissionsAsync();
+                    setCameraPermission(status === 'granted');
+                  }}
+                >
+                  <Text style={styles.permissionButtonText}>Grant Permission</Text>
+                </TouchableOpacity>
               </View>
-            ) : null}
-            <View style={styles.bottomContainer}>
-              <Text style={styles.title}>Trailblaze</Text>
-              <Text style={styles.subtitle}>Capture Your Journey</Text>
-              <TouchableOpacity
-                style={styles.startButton}
-                onPress={() => setShowARScreen(true)}
-                disabled={isTakingPhoto}
-              >
-                <Text style={styles.startButtonText}>Start Experience</Text>
-              </TouchableOpacity>
-            </View>
+            )}
           </View>
-        </ScrollView>
-      )}
-      
-      {/* Render landmark details modal */}
-      {renderLandmarkModal()}
-    </SafeAreaView>
-  );
+        ) : (
+          <ScrollView 
+            contentContainerStyle={styles.scrollContainer}
+            bounces={false}
+          >
+            <View style={styles.startContainer}>
+              {capturedPhoto ? (
+                <View style={styles.previewContainer}>
+                  <Text style={styles.previewText}>
+                    {isLandmark ? 'Landmark Detected!' : 'Landmark NOT Detected'}
+                  </Text>
+                  <Image 
+                    source={{ uri: capturedPhoto }} 
+                    style={styles.previewImage}
+                    resizeMode="contain"
+                  />
+                  {isLandmark && analyzeResults && (
+                    <View style={styles.analysisContainer}>
+                      <Text style={styles.analysisText}>{analyzeResults}</Text>
+                      {landmarkDetails && (
+                        <TouchableOpacity 
+                          style={styles.factsButton}
+                          onPress={() => setShowLandmarkModal(true)}
+                        >
+                          <Text style={styles.factsButtonText}>View Fun Facts</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  )}
+                  {!isLandmark && (
+                    <View style={styles.analysisContainer}>
+                      <Text style={styles.analysisText}>
+                        No landmark was detected in this photo.
+                      </Text>
+                    </View>
+                  )}
+                </View>
+              ) : null}
+              <View style={styles.bottomContainer}>
+                <Text style={styles.title}>Trailblaze</Text>
+                <Text style={styles.subtitle}>Capture Your Journey</Text>
+                <TouchableOpacity
+                  style={styles.startButton}
+                  onPress={() => setShowARScreen(true)}
+                  disabled={isTakingPhoto}
+                >
+                  <Text style={styles.startButtonText}>Start Experience</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </ScrollView>
+        )}
+        
+        {/* Render landmark details modal */}
+        {renderLandmarkModal()}
+      </SafeAreaView>
+    );
+  } catch (error) {
+    // This will catch render errors
+    console.error('FATAL APP ERROR:', error);
+    return (
+      <SafeAreaView style={[styles.container, {justifyContent: 'center', alignItems: 'center'}]}>
+        <Text style={{color: 'white', fontSize: 18, textAlign: 'center', padding: 20}}>
+          Something went wrong with the app. Please restart.
+        </Text>
+        <Text style={{color: '#FF3366', fontSize: 14, marginTop: 10}}>
+          Error: {error.message}
+        </Text>
+      </SafeAreaView>
+    );
+  }
 }
 
 const styles = StyleSheet.create({
